@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,34 +67,34 @@ const (
 // It supports Single (Standalone), Cluster, or Sentinal (Failover) Redis server configurations.
 type RedisStorage struct {
 	// ClientType specifies the Redis client type. Valid values are "cluster" or "failover"
-	ClientType    string   `json:"client_type"`
+	ClientType string `json:"client_type"`
 	// Address The full address of the Redis server. Example: "127.0.0.1:6379"
 	// If not defined, will be generated from Host and Port parameters.
-	Address       []string `json:"address"`
+	Address []string `json:"address"`
 	// Host The Redis server hostname or IP address. Default: "127.0.0.1"
-	Host          []string `json:"host"`
+	Host []string `json:"host"`
 	// Host The Redis server port number. Default: "6379"
-	Port          []string `json:"port"`
+	Port []string `json:"port"`
 	// DB The Redis server database number. Default: 0
-	DB            int      `json:"db"`
+	DB int `json:"db"`
 	// Timeout The Redis server timeout in seconds. Default: 5
-	Timeout       string   `json:"timeout"`
+	Timeout string `json:"timeout"`
 	// Username The username for authenticating with the Redis server. Default: "" (No authentication)
-	Username      string   `json:"username"`
+	Username string `json:"username"`
 	// Password The password for authenticating with the Redis server. Default: "" (No authentication)
-	Password      string   `json:"password"`
+	Password string `json:"password"`
 	// SentinelPassword Optional The Redis sentinel password if authentication is enabled.
 	SentinelPassword string `json:"sentinel_password"`
 	// MasterName Only required when connecting to Redis via Sentinal (Failover mode). Default ""
-	MasterName    string   `json:"master_name"`
+	MasterName string `json:"master_name"`
 	// KeyPrefix A string prefix that is appended to Redis keys. Default: "caddy"
 	// Useful when the Redis server is used by multiple applications.
-	KeyPrefix     string   `json:"key_prefix"`
+	KeyPrefix string `json:"key_prefix"`
 	// EncryptionKey A key string used to symmetrically encrypt and decrypt data stored in Redis.
 	// The key must be exactly 32 characters, longer values will be truncated. Default: "" (No encryption)
-	EncryptionKey string   `json:"encryption_key"`
+	EncryptionKey string `json:"encryption_key"`
 	// Compression Specifies whether values should be compressed before storing in Redis. Default: false
-	Compression   bool     `json:"compression"`
+	Compression bool `json:"compression"`
 	// TlsEnabled controls whether TLS will be used to connect to the Redis
 	// server. False by default.
 	TlsEnabled bool `json:"tls_enabled"`
@@ -116,9 +117,24 @@ type RedisStorage struct {
 	// https://pkg.go.dev/crypto/x509#CertPool.AppendCertsFromPEM
 	TlsServerCertsPath string `json:"tls_server_certs_path"`
 	// RouteByLatency Route commands by latency, only used in Cluster mode. Default: false
-	RouteByLatency     bool   `json:"route_by_latency"`
+	// PoolSize caps concurrent connections per Redis node. Zero applies a
+	// default of 50 x GOMAXPROCS: the library's own default (5 x GOMAXPROCS)
+	// collapses under an on-demand TLS edge, where every uncached handshake
+	// makes sequential storage reads and thousands can be in flight at once.
+	PoolSize int `json:"pool_size,omitempty"`
+
+	// MinIdleConns keeps connections pre-warmed so a burst does not pay
+	// dial+auth latency for its whole first wave.
+	MinIdleConns int `json:"min_idle_conns,omitempty"`
+
+	// PoolTimeout is how long, in seconds, a caller waits for a free
+	// connection before erroring. Empty keeps the library default
+	// (ReadTimeout + 1s).
+	PoolTimeout string `json:"pool_timeout,omitempty"`
+
+	RouteByLatency bool `json:"route_by_latency"`
 	// RouteRandomly Route commands randomly, only used in Cluster mode. Default: false
-	RouteRandomly      bool   `json:"route_randomly"`
+	RouteRandomly bool `json:"route_randomly"`
 
 	client redis.UniversalClient
 	locker *redislock.Client
@@ -150,6 +166,26 @@ func New() *RedisStorage {
 	return &rs
 }
 
+// applyPoolConfig sets connection-pool options, defaulting the pool to a size
+// that survives an on-demand TLS edge rather than the library default.
+func (rs *RedisStorage) applyPoolConfig(opts *redis.UniversalOptions) {
+	opts.PoolSize = rs.PoolSize
+	if opts.PoolSize <= 0 {
+		opts.PoolSize = 50 * runtime.GOMAXPROCS(0)
+	}
+
+	opts.MinIdleConns = rs.MinIdleConns
+	if opts.MinIdleConns <= 0 {
+		opts.MinIdleConns = 5
+	}
+
+	if rs.PoolTimeout != "" {
+		if seconds, err := strconv.Atoi(rs.PoolTimeout); err == nil && seconds > 0 {
+			opts.PoolTimeout = time.Duration(seconds) * time.Second
+		}
+	}
+}
+
 // Initilalize Redis client and locker
 func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 
@@ -170,6 +206,8 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 		clientOpts.ReadTimeout = time.Duration(timeout) * time.Second
 		clientOpts.WriteTimeout = time.Duration(timeout) * time.Second
 	}
+
+	rs.applyPoolConfig(&clientOpts)
 
 	// Configure cluster routing options
 	if rs.RouteByLatency || rs.RouteRandomly {
